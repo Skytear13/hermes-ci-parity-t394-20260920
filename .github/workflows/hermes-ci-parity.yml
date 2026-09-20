@@ -1,10 +1,18 @@
 name: Hermes CI parity
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/hermes-ci-parity.yml"
   workflow_dispatch:
 
 permissions:
   contents: read
+
+concurrency:
+  group: hermes-t394-ci-parity-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
@@ -19,13 +27,27 @@ jobs:
           mkdir -p runner-evidence
           uname -a | tee runner-evidence/uname.txt
           cat /etc/os-release | tee runner-evidence/os-release.txt
-          nproc | tee runner-evidence/nproc.txt
+          printf 'nproc=%s\n' "$(nproc)" | tee runner-evidence/nproc.txt
           free -h | tee runner-evidence/memory.txt
           df -h | tee runner-evidence/disk.txt
           python3 --version | tee runner-evidence/python-system.txt
           git --version | tee runner-evidence/git.txt
           locale | tee runner-evidence/locale.txt
-          printf 'TZ=%s\nLANG=%s\n' "${TZ-}" "${LANG-}" | tee runner-evidence/env-locale.txt
+
+      - name: Clone and bind exact frozen Hermes source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone https://github.com/NousResearch/hermes-agent.git source
+          cd source
+          git checkout --detach 345cd2b057a452236de401d3534b8502a7465e8d
+          test "$(git rev-parse HEAD)" = "345cd2b057a452236de401d3534b8502a7465e8d"
+          test "$(git rev-parse 'HEAD^{tree}')" = "6e14b9791cdc5a47068685e9429dd5d6bdc5ef5f"
+          test "$(git describe --tags --exact-match HEAD)" = "v2026.9.14"
+          git rev-parse HEAD | tee ../runner-evidence/source-head.txt
+          git rev-parse 'HEAD^{tree}' | tee ../runner-evidence/source-tree.txt
+          git describe --tags --exact-match HEAD | tee ../runner-evidence/source-tag.txt
+          sha256sum pyproject.toml uv.lock | tee ../runner-evidence/manifests.sha256
 
       - name: Install ripgrep from frozen contract
         shell: bash
@@ -43,7 +65,7 @@ jobs:
           rg --version | tee runner-evidence/rg.txt
 
       - name: Install exact uv
-        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # frozen v8.2.0 action commit
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39
         with:
           version: "0.9.28"
           enable-cache: true
@@ -51,60 +73,83 @@ jobs:
             source/pyproject.toml
             source/uv.lock
 
-      - name: Clone and bind exact frozen Hermes source
+      - name: Set up Python 3.11 with frozen retry semantics
+        working-directory: source
         shell: bash
         run: |
-          set -euo pipefail
-          git clone https://github.com/NousResearch/hermes-agent.git source
-          cd source
-          git checkout --detach 345cd2b057a452236de401d3534b8502a7465e8d
-          test "$(git rev-parse HEAD)" = "345cd2b057a452236de401d3534b8502a7465e8d"
-          test "$(git rev-parse HEAD^{tree})" = "6e14b9791cdc5a47068685e9429dd5d6bdc5ef5f"
-          test "$(git describe --tags --exact-match)" = "v2026.9.14"
-          git rev-parse HEAD | tee ../runner-evidence/source-head.txt
-          git rev-parse HEAD^{tree} | tee ../runner-evidence/source-tree.txt
-          git describe --tags --exact-match | tee ../runner-evidence/source-tag.txt
+          set -uo pipefail
+          retry() {
+            local n=0
+            local max=3
+            while :; do
+              n=$((n + 1))
+              echo "::group::attempt $n/$max: $*"
+              if "$@"; then
+                echo "::endgroup::"
+                return 0
+              fi
+              echo "::endgroup::"
+              if [ "$n" -ge "$max" ]; then
+                return 1
+              fi
+              sleep 10
+            done
+          }
+          retry uv python install 3.11
 
       - name: Install exact frozen dependencies
         working-directory: source
         shell: bash
         run: |
-          set -euo pipefail
-          uv sync --locked --python 3.11 \
-            --extra all \
-            --extra dev \
-            --extra anthropic \
-            --extra mistral \
-            --extra fal \
-            --extra modal \
-            --extra daytona \
-            --extra hindsight \
-            --extra parallel-web
+          set -uo pipefail
+          retry_cmd() {
+            local n=0
+            local max=3
+            local cmd="$1"
+            while :; do
+              n=$((n + 1))
+              echo "::group::attempt $n/$max: $cmd"
+              if bash -c "$cmd"; then
+                echo "::endgroup::"
+                return 0
+              fi
+              echo "::endgroup::"
+              if [ "$n" -ge "$max" ]; then
+                return 1
+              fi
+              sleep 10
+            done
+          }
+          retry_cmd 'uv sync --locked --python 3.11 --extra all --extra dev --extra anthropic --extra mistral --extra fal --extra modal --extra daytona --extra hindsight --extra parallel-web'
           .venv/bin/python --version | tee ../runner-evidence/python-venv.txt
           uv --version | tee ../runner-evidence/uv.txt
-          sha256sum pyproject.toml uv.lock | tee ../runner-evidence/manifests.sha256
+
+      - name: Minimize uv cache
+        working-directory: source
+        run: uv cache prune --ci
 
       - name: Run complete canonical suite
         working-directory: source
         shell: bash
         env:
-          TZ: UTC
-          LANG: C.UTF-8
-          PYTHONHASHSEED: "0"
+          HERMES_TEST_WORKERS: "4"
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""
           NOUS_API_KEY: ""
-          HERMES_HOME: "${{ runner.temp }}/hermes-home"
         run: |
           set -euo pipefail
-          export HERMES_TEST_WORKERS="$(nproc)"
-          printf 'frozen_workers=96\nactual_nproc=%s\neffective_workers=%s\nCI_HARDWARE_PARITY=false\nCI_SEMANTIC_RUNNER_PARITY=true\n' "$(nproc)" "$HERMES_TEST_WORKERS" | tee ../runner-evidence/parallelism.txt
+          source .venv/bin/activate
+          printf 'frozen_workers=96\nactual_nproc=%s\neffective_workers=%s\nCI_HARDWARE_PARITY=false\nCI_SEMANTIC_RUNNER_PARITY=true\n' \
+            "$(nproc)" "$HERMES_TEST_WORKERS" | tee ../runner-evidence/parallelism.txt
           scripts/run_tests.sh 2>&1 | tee ../runner-evidence/full-suite.log
 
       - name: Verify tracked source remained unchanged
+        if: always()
         working-directory: source
         shell: bash
         run: |
           set -euo pipefail
-          git diff --exit-code
-          git status --porcelain | tee ../runner-evidence/source-status.txt
+          git diff --exit-code -- .
+          echo "UNTRACKED_STATUS_BEGIN"
+          git status --porcelain --untracked-files=all || true
+          echo "UNTRACKED_STATUS_END"
