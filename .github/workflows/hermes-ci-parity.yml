@@ -1,0 +1,110 @@
+name: Hermes CI parity
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Exact frozen Hermes suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Runner resource preflight
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p runner-evidence
+          uname -a | tee runner-evidence/uname.txt
+          cat /etc/os-release | tee runner-evidence/os-release.txt
+          nproc | tee runner-evidence/nproc.txt
+          free -h | tee runner-evidence/memory.txt
+          df -h | tee runner-evidence/disk.txt
+          python3 --version | tee runner-evidence/python-system.txt
+          git --version | tee runner-evidence/git.txt
+          locale | tee runner-evidence/locale.txt
+          printf 'TZ=%s\nLANG=%s\n' "${TZ-}" "${LANG-}" | tee runner-evidence/env-locale.txt
+
+      - name: Install ripgrep from frozen contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          RG_VERSION=15.1.0
+          RG_SHA256=1c9297be4a084eea7ecaedf93eb03d058d6faae29bbc57ecdaf5063921491599
+          RG_TARBALL=ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl.tar.gz
+          curl -sSfL --retry 3 --retry-delay 5 -o "$RG_TARBALL" \
+            "https://github.com/BurntSushi/ripgrep/releases/download/${RG_VERSION}/${RG_TARBALL}"
+          echo "${RG_SHA256}  ${RG_TARBALL}" | sha256sum -c -
+          tar -xzf "$RG_TARBALL"
+          sudo mv "ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl/rg" /usr/local/bin/rg
+          rm -rf "$RG_TARBALL" "ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl"
+          rg --version | tee runner-evidence/rg.txt
+
+      - name: Install exact uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # frozen v8.2.0 action commit
+        with:
+          version: "0.9.28"
+          enable-cache: true
+          cache-dependency-glob: |
+            source/pyproject.toml
+            source/uv.lock
+
+      - name: Clone and bind exact frozen Hermes source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone https://github.com/NousResearch/hermes-agent.git source
+          cd source
+          git checkout --detach 345cd2b057a452236de401d3534b8502a7465e8d
+          test "$(git rev-parse HEAD)" = "345cd2b057a452236de401d3534b8502a7465e8d"
+          test "$(git rev-parse HEAD^{tree})" = "6e14b9791cdc5a47068685e9429dd5d6bdc5ef5f"
+          test "$(git describe --tags --exact-match)" = "v2026.9.14"
+          git rev-parse HEAD | tee ../runner-evidence/source-head.txt
+          git rev-parse HEAD^{tree} | tee ../runner-evidence/source-tree.txt
+          git describe --tags --exact-match | tee ../runner-evidence/source-tag.txt
+
+      - name: Install exact frozen dependencies
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv sync --locked --python 3.11 \
+            --extra all \
+            --extra dev \
+            --extra anthropic \
+            --extra mistral \
+            --extra fal \
+            --extra modal \
+            --extra daytona \
+            --extra hindsight \
+            --extra parallel-web
+          .venv/bin/python --version | tee ../runner-evidence/python-venv.txt
+          uv --version | tee ../runner-evidence/uv.txt
+          sha256sum pyproject.toml uv.lock | tee ../runner-evidence/manifests.sha256
+
+      - name: Run complete canonical suite
+        working-directory: source
+        shell: bash
+        env:
+          TZ: UTC
+          LANG: C.UTF-8
+          PYTHONHASHSEED: "0"
+          OPENROUTER_API_KEY: ""
+          OPENAI_API_KEY: ""
+          NOUS_API_KEY: ""
+          HERMES_HOME: "${{ runner.temp }}/hermes-home"
+        run: |
+          set -euo pipefail
+          export HERMES_TEST_WORKERS="$(nproc)"
+          printf 'frozen_workers=96\nactual_nproc=%s\neffective_workers=%s\nCI_HARDWARE_PARITY=false\nCI_SEMANTIC_RUNNER_PARITY=true\n' "$(nproc)" "$HERMES_TEST_WORKERS" | tee ../runner-evidence/parallelism.txt
+          scripts/run_tests.sh 2>&1 | tee ../runner-evidence/full-suite.log
+
+      - name: Verify tracked source remained unchanged
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --exit-code
+          git status --porcelain | tee ../runner-evidence/source-status.txt
