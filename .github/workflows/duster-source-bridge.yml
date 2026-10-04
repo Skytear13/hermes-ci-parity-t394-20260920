@@ -1,0 +1,36 @@
+name: Duster source bridge
+on:
+  push:
+    branches:
+      - tmp-duster-source-bridge-20261005
+
+permissions:
+  contents: read
+
+jobs:
+  bundle:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout exact upstream OBDScanner
+        uses: actions/checkout@v4
+        with:
+          repository: parhipov/OBDScanner
+          ref: f8668a5832e10e2dd5024c6b48bc4d5709b3eecc
+          path: source
+          fetch-depth: 1
+
+      - name: Verify pinned commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C source rev-parse HEAD)" = "f8668a5832e10e2dd5024c6b48bc4d5709b3eecc"
+          git -C source status --porcelain=v1
+          tar -czf upstream-obdscanner-v2.0-f8668a.tar.gz source
+
+      - name: Upload exact checkout
+        uses: actions/upload-artifact@v4
+        with:
+          name: duster-upstream-v2-exact-source
+          path: upstream-obdscanner-v2.0-f8668a.tar.gz
+          if-no-files-found: error
+          retention-days: 1
