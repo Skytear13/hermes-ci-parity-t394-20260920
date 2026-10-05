@@ -1,0 +1,59 @@
+name: Duster fix7 source gate
+on:
+  push:
+    branches:
+      - tmp-duster-fix7-20261005
+permissions:
+  contents: read
+jobs:
+  source-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Checkout exact upstream
+        uses: actions/checkout@v4
+        with:
+          repository: parhipov/OBDScanner
+          ref: f8668a5832e10e2dd5024c6b48bc4d5709b3eecc
+          path: source
+          fetch-depth: 1
+      - name: Apply verified source patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C source rev-parse HEAD)" = "f8668a5832e10e2dd5024c6b48bc4d5709b3eecc"
+          base64 -d ci/duster-fix7-full.patch.gz.b64 | gzip -dc > fix7.patch
+          git -C source apply --check ../fix7.patch
+          git -C source apply ../fix7.patch
+          git -C source diff --check
+          test -f source/DUSTER_CLOUD_STATE.txt
+          grep -q 'source_version=2.2.0-cloud-t1r2' source/DUSTER_CLOUD_STATE.txt
+          ! grep -RIn '\.elm\.send' source/app/src/main/java
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Unit tests and lint only
+        shell: bash
+        working-directory: source
+        run: |
+          set -euo pipefail
+          chmod +x gradlew
+          ./gradlew testDebugUnitTest lintDebug --no-daemon --stacktrace
+      - name: Collect evidence
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p out
+          cp -a source/app/build/reports/tests out/tests 2>/dev/null || true
+          cp source/app/build/reports/lint-results-debug.txt out/ 2>/dev/null || true
+          cp source/app/build/reports/lint-results-debug.html out/ 2>/dev/null || true
+          git -C source diff --binary > out/DusterOBD-fix7-applied.patch
+          sha256sum out/DusterOBD-fix7-applied.patch > out/SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: DusterOBD-fix7-source-gate
+          path: out
+          retention-days: 2
