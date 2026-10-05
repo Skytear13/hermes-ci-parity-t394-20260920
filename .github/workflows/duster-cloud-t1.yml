@@ -1,0 +1,67 @@
+name: Duster CLOUD-T1 source gate
+on:
+  push:
+    branches:
+      - tmp-duster-cloud-t1-20261005
+
+permissions:
+  contents: read
+
+jobs:
+  source-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout exact upstream OBDScanner v2.0
+        uses: actions/checkout@v4
+        with:
+          repository: parhipov/OBDScanner
+          ref: f8668a5832e10e2dd5024c6b48bc4d5709b3eecc
+          path: source
+          fetch-depth: 1
+
+      - name: Verify and apply CLOUD-T1
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C source rev-parse HEAD)" = "f8668a5832e10e2dd5024c6b48bc4d5709b3eecc"
+          base64 -d ci/duster-cloud-t1.patch.gz.b64 | gzip -dc > cloud-t1.patch
+          git -C source apply --check ../cloud-t1.patch
+          git -C source apply ../cloud-t1.patch
+          git -C source diff --check
+          grep -q 'applicationId = "com.obdscanner.duster"' source/app/build.gradle.kts
+          ! grep -q 'signingConfig = signingConfigs.getByName("debug")' source/app/build.gradle.kts
+          grep -q 'READ_ONLY' source/app/src/main/java/com/obdscanner/obd/DiagnosticSafety.kt
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Unit tests and lint only - NO APK BUILD
+        shell: bash
+        working-directory: source
+        run: |
+          set -euo pipefail
+          chmod +x gradlew
+          ./gradlew testDebugUnitTest lintDebug --no-daemon --stacktrace
+
+      - name: Collect evidence
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p out
+          cp -a source/app/build/reports/tests out/tests 2>/dev/null || true
+          cp source/app/build/reports/lint-results-debug.txt out/ 2>/dev/null || true
+          cp source/app/build/reports/lint-results-debug.html out/ 2>/dev/null || true
+          git -C source diff --binary > out/DusterOBD-CLOUD-T1-applied.patch
+          sha256sum out/DusterOBD-CLOUD-T1-applied.patch > out/SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: DusterOBD-CLOUD-T1-source-gate
+          path: out
+          retention-days: 2
