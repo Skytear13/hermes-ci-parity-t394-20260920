@@ -1,0 +1,29 @@
+name: Duster signing tools
+on:
+  push:
+    branches:
+      - tmp-duster-sign-tools-20261005
+permissions:
+  contents: read
+jobs:
+  tools:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bundle Android signing tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          BT="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -1)"
+          mkdir -p out/lib
+          cp "$BT/apksigner" out/
+          cp "$BT/zipalign" out/
+          cp "$BT/lib/apksigner.jar" out/lib/
+          chmod +x out/apksigner out/zipalign
+          printf 'build_tools=%s\n' "$(basename "$BT")" > out/VERSION.txt
+          sha256sum out/apksigner out/zipalign out/lib/apksigner.jar > out/SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: duster-android-signing-tools
+          path: out
+          retention-days: 1
