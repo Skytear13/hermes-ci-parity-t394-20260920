@@ -1,0 +1,96 @@
+name: Duster T3 alpha1 build
+on:
+  push:
+    branches:
+      - tmp-duster-t3-alpha1-20261005
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout CI payload
+        uses: actions/checkout@v4
+
+      - name: Checkout exact upstream OBDScanner v2.0
+        uses: actions/checkout@v4
+        with:
+          repository: parhipov/OBDScanner
+          ref: f8668a5832e10e2dd5024c6b48bc4d5709b3eecc
+          path: source
+          fetch-depth: 1
+
+      - name: Verify exact upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C source rev-parse HEAD)" = "f8668a5832e10e2dd5024c6b48bc4d5709b3eecc"
+          test "$(git -C source write-tree)" = "b26ccf120290f5331d188f12bb4ecf41bb1fc6e6"
+          test -z "$(git -C source status --porcelain=v1)"
+
+      - name: Decode and apply Duster overlay
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p t3overlay
+          base64 -d ci/duster-t3-overlay.tar.gz.b64 > t3overlay/payload.tar.gz
+          tar -xzf t3overlay/payload.tar.gz -C t3overlay
+          python3 t3overlay/tools/apply_t2.py source
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path("source/app/build.gradle.kts")
+          s=p.read_text()
+          s=s.replace('versionCode = 40','versionCode = 41',1)
+          s=s.replace('versionName = "2.2.0-dev2"','versionName = "2.2.0-alpha1"',1)
+          p.write_text(s)
+          p=Path("source/DUSTER_T2_BASE.txt")
+          s=p.read_text().replace("duster_version=2.2.0-dev2","duster_version=2.2.0-alpha1")
+          p.write_text(s)
+          PY
+          git -C source diff --check
+          grep -q 'applicationId = "com.obdscanner.duster"' source/app/build.gradle.kts
+          grep -q 'versionCode = 41' source/app/build.gradle.kts
+          grep -q 'versionName = "2.2.0-alpha1"' source/app/build.gradle.kts
+          grep -q 'READ-ONLY DUSTER BUILD: Mode 04 blocked' source/app/src/main/java/com/obdscanner/ObdManager.kt
+          ! grep -RInE '"(14|27|2E|2F|31|3B)[0-9A-Fa-f]' source/app/src/main/java/com/obdscanner/renault source/app/src/main/java/com/obdscanner/pila
+          git -C source diff --binary > source/DusterOBD-v2.2.0-alpha1-from-upstream-v2.patch
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Gradle tests lint build
+        shell: bash
+        working-directory: source
+        run: |
+          set -euo pipefail
+          chmod +x gradlew
+          ./gradlew testDebugUnitTest lintDebug assembleDebug assembleRelease --no-daemon --stacktrace
+
+      - name: Collect artifact
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          find source/app/build/outputs/apk -type f -name '*.apk' -exec cp {} out/ \;
+          cp source/DusterOBD-v2.2.0-alpha1-from-upstream-v2.patch out/
+          cp source/DUSTER_T2_BASE.txt out/
+          cp -a source/app/build/reports/tests out/tests 2>/dev/null || true
+          cp source/app/build/reports/lint-results-debug.html out/ 2>/dev/null || true
+          cp source/app/build/reports/lint-results-debug.txt out/ 2>/dev/null || true
+          sha256sum out/*.apk out/*.patch > out/SHA256SUMS.txt
+
+      - name: Upload T3 artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: DusterOBD-v2.2.0-alpha1-T3-build
+          path: out
+          if-no-files-found: error
+          retention-days: 3
